@@ -4,15 +4,13 @@ import {
     View,
     Text,
     StyleSheet,
-    Dimensions,
     BackHandler,
     StatusBar,
+    Animated,
 } from 'react-native';
 import { Audio } from 'expo-av';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import StepDetector from './StepDetector';
-
-const { width, height } = Dimensions.get('window');
 
 interface AlarmScreenProps {
     onDismiss: () => void;
@@ -21,37 +19,62 @@ interface AlarmScreenProps {
 
 const AlarmScreen: React.FC<AlarmScreenProps> = ({
     onDismiss,
-    requiredSteps = 10
+    requiredSteps = 10,
 }) => {
     const [currentTime, setCurrentTime] = useState<string>('');
     const [stepCount, setStepCount] = useState<number>(0);
-    const [isPlaying, setIsPlaying] = useState<boolean>(true);
+    const [isComplete, setIsComplete] = useState<boolean>(false);
+
     const soundRef = useRef<Audio.Sound | null>(null);
+    const pulseAnim = useRef(new Animated.Value(1)).current;
 
     useEffect(() => {
+        console.log('🔔 Alarm screen mounted');
+
         // Keep screen awake
         activateKeepAwakeAsync();
 
         // Prevent back button
         const backHandler = BackHandler.addEventListener('hardwareBackPress', () => {
-            // Block back button - must walk to dismiss!
-            return true;
+            console.log('⛔ Back button blocked');
+            return true; // Block back button
         });
 
         // Start alarm sound
         playAlarmSound();
 
-        // Update time
+        // Update time every second
         updateTime();
-        const interval = setInterval(updateTime, 1000);
+        const timeInterval = setInterval(updateTime, 1000);
+
+        // Start pulse animation
+        startPulseAnimation();
 
         return () => {
+            console.log('🔔 Alarm screen unmounting');
             backHandler.remove();
             stopAlarmSound();
             deactivateKeepAwake();
-            clearInterval(interval);
+            clearInterval(timeInterval);
         };
     }, []);
+
+    const startPulseAnimation = () => {
+        Animated.loop(
+            Animated.sequence([
+                Animated.timing(pulseAnim, {
+                    toValue: 1.1,
+                    duration: 500,
+                    useNativeDriver: true,
+                }),
+                Animated.timing(pulseAnim, {
+                    toValue: 1,
+                    duration: 500,
+                    useNativeDriver: true,
+                }),
+            ])
+        ).start();
+    };
 
     const updateTime = () => {
         const now = new Date();
@@ -59,6 +82,7 @@ const AlarmScreen: React.FC<AlarmScreenProps> = ({
             now.toLocaleTimeString('en-US', {
                 hour: '2-digit',
                 minute: '2-digit',
+                second: '2-digit',
                 hour12: true,
             })
         );
@@ -66,7 +90,8 @@ const AlarmScreen: React.FC<AlarmScreenProps> = ({
 
     const playAlarmSound = async () => {
         try {
-            // Configure audio
+            console.log('🔊 Setting up audio...');
+
             await Audio.setAudioModeAsync({
                 allowsRecordingIOS: false,
                 staysActiveInBackground: true,
@@ -75,10 +100,9 @@ const AlarmScreen: React.FC<AlarmScreenProps> = ({
                 playThroughEarpieceAndroid: false,
             });
 
-            // Use built-in system sound or create a beeping pattern
+            // Using a reliable alarm sound URL
             const { sound } = await Audio.Sound.createAsync(
-                // You can replace this with your own alarm.mp3 in assets folder
-                { uri: 'https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3' },
+                { uri: 'https://www.soundjay.com/misc/sounds/bell-ringing-05.mp3' },
                 {
                     isLooping: true,
                     volume: 1.0,
@@ -87,20 +111,11 @@ const AlarmScreen: React.FC<AlarmScreenProps> = ({
             );
 
             soundRef.current = sound;
-            setIsPlaying(true);
-
-            console.log('🔔 Alarm sound playing');
+            console.log('🔊 Alarm sound playing');
         } catch (error) {
-            console.error('Error playing alarm:', error);
-            // Fallback: Use vibration pattern
-            startVibrationPattern();
+            console.error('Error playing alarm sound:', error);
+            // Sound failed, but alarm still works with visual
         }
-    };
-
-    const startVibrationPattern = () => {
-        // Continuous vibration pattern as fallback
-        const pattern = [0, 500, 200, 500, 200, 500];
-        // Note: This won't loop automatically on all devices
     };
 
     const stopAlarmSound = async () => {
@@ -109,22 +124,24 @@ const AlarmScreen: React.FC<AlarmScreenProps> = ({
                 await soundRef.current.stopAsync();
                 await soundRef.current.unloadAsync();
                 soundRef.current = null;
-                setIsPlaying(false);
                 console.log('🔕 Alarm sound stopped');
             } catch (error) {
-                console.error('Error stopping alarm:', error);
+                console.error('Error stopping sound:', error);
             }
         }
     };
 
-    const handleTargetReached = () => {
-        console.log('🎉 Walk target reached! Dismissing alarm...');
-        stopAlarmSound();
+    const handleTargetReached = async () => {
+        console.log('🎉 Walk target reached!');
+        setIsComplete(true);
 
-        // Small delay before dismissing for celebration
+        // Stop the alarm sound
+        await stopAlarmSound();
+
+        // Wait a moment to show success, then dismiss
         setTimeout(() => {
             onDismiss();
-        }, 1500);
+        }, 2000);
     };
 
     const handleStepCountChange = (count: number) => {
@@ -135,61 +152,59 @@ const AlarmScreen: React.FC<AlarmScreenProps> = ({
         <View style={styles.container}>
             <StatusBar hidden />
 
-            {/* Background Gradient Effect */}
-            <View style={styles.gradientBg} />
-
-            {/* Alarm Icon Animation */}
-            <View style={styles.alarmIconContainer}>
+            {/* Animated Alarm Icon */}
+            <Animated.View
+                style={[
+                    styles.alarmIconContainer,
+                    { transform: [{ scale: pulseAnim }] }
+                ]}
+            >
                 <Text style={styles.alarmIcon}>⏰</Text>
-                <View style={styles.pulseRing} />
-            </View>
+            </Animated.View>
 
             {/* Current Time */}
             <Text style={styles.timeText}>{currentTime}</Text>
 
             {/* Wake Up Message */}
             <View style={styles.messageContainer}>
-                <Text style={styles.wakeUpText}>WAKE UP!</Text>
-                <Text style={styles.subMessage}>
-                    Walk {requiredSteps} steps to turn off the alarm
-                </Text>
+                {isComplete ? (
+                    <>
+                        <Text style={styles.successText}>🎉 GREAT JOB! 🎉</Text>
+                        <Text style={styles.successSubtext}>You're awake! Have a great day!</Text>
+                    </>
+                ) : (
+                    <>
+                        <Text style={styles.wakeUpText}>WAKE UP!</Text>
+                        <Text style={styles.subMessage}>
+                            Walk {requiredSteps} steps to turn off the alarm
+                        </Text>
+                    </>
+                )}
             </View>
 
             {/* Step Detector */}
-            <View style={styles.stepDetectorContainer}>
-                <StepDetector
-                    targetSteps={requiredSteps}
-                    onTargetReached={handleTargetReached}
-                    onStepCountChange={handleStepCountChange}
-                    isActive={true}
-                />
-            </View>
+            {!isComplete && (
+                <View style={styles.stepDetectorContainer}>
+                    <StepDetector
+                        targetSteps={requiredSteps}
+                        onTargetReached={handleTargetReached}
+                        onStepCountChange={handleStepCountChange}
+                        isActive={true}
+                    />
+                </View>
+            )}
 
-            {/* Encouragement */}
-            <View style={styles.encouragementContainer}>
-                {stepCount === 0 && (
-                    <Text style={styles.encouragementText}>
-                        🚶 Get up and start walking!
+            {/* Warning */}
+            {!isComplete && (
+                <View style={styles.warningContainer}>
+                    <Text style={styles.warningText}>
+                        🔒 Walk {requiredSteps - stepCount} more steps to dismiss
                     </Text>
-                )}
-                {stepCount > 0 && stepCount < requiredSteps && (
-                    <Text style={styles.encouragementText}>
-                        💪 Keep going! {requiredSteps - stepCount} more steps!
+                    <Text style={styles.warningSubtext}>
+                        Back button is disabled • Cannot close app
                     </Text>
-                )}
-                {stepCount >= requiredSteps && (
-                    <Text style={styles.successText}>
-                        🎉 Great job! You're awake!
-                    </Text>
-                )}
-            </View>
-
-            {/* Cannot Dismiss Warning */}
-            <View style={styles.warningContainer}>
-                <Text style={styles.warningText}>
-                    🔒 This alarm cannot be dismissed without walking
-                </Text>
-            </View>
+                </View>
+            )}
         </View>
     );
 };
@@ -199,94 +214,76 @@ const styles = StyleSheet.create({
         flex: 1,
         backgroundColor: '#0f172a',
         alignItems: 'center',
-        justifyContent: 'center',
-        padding: 20,
-    },
-    gradientBg: {
-        position: 'absolute',
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        backgroundColor: '#0f172a',
+        justifyContent: 'flex-start',
+        paddingTop: 60,
+        paddingHorizontal: 20,
     },
     alarmIconContainer: {
-        position: 'relative',
-        marginBottom: 20,
+        marginBottom: 15,
     },
     alarmIcon: {
-        fontSize: 80,
-    },
-    pulseRing: {
-        position: 'absolute',
-        top: -20,
-        left: -20,
-        right: -20,
-        bottom: -20,
-        borderRadius: 100,
-        borderWidth: 3,
-        borderColor: '#f97316',
-        opacity: 0.5,
+        fontSize: 70,
     },
     timeText: {
-        fontSize: 64,
+        fontSize: 48,
         fontWeight: 'bold',
         color: '#ffffff',
         marginBottom: 10,
     },
     messageContainer: {
         alignItems: 'center',
-        marginBottom: 30,
+        marginBottom: 20,
     },
     wakeUpText: {
-        fontSize: 36,
+        fontSize: 32,
         fontWeight: 'bold',
         color: '#f97316',
-        letterSpacing: 4,
-        marginBottom: 10,
+        letterSpacing: 3,
+        marginBottom: 8,
     },
     subMessage: {
-        fontSize: 18,
+        fontSize: 16,
         color: '#94a3b8',
         textAlign: 'center',
     },
+    successText: {
+        fontSize: 36,
+        fontWeight: 'bold',
+        color: '#22c55e',
+        marginBottom: 10,
+    },
+    successSubtext: {
+        fontSize: 18,
+        color: '#86efac',
+    },
     stepDetectorContainer: {
         width: '100%',
-        backgroundColor: 'rgba(30, 41, 59, 0.8)',
-        borderRadius: 24,
-        padding: 20,
-        marginBottom: 20,
-    },
-    encouragementContainer: {
-        minHeight: 40,
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    encouragementText: {
-        fontSize: 18,
-        color: '#f97316',
-        fontWeight: '600',
-    },
-    successText: {
-        fontSize: 24,
-        color: '#22c55e',
-        fontWeight: 'bold',
+        backgroundColor: 'rgba(30, 41, 59, 0.9)',
+        borderRadius: 20,
+        padding: 15,
+        marginBottom: 15,
     },
     warningContainer: {
         position: 'absolute',
         bottom: 40,
         left: 20,
         right: 20,
-        backgroundColor: 'rgba(239, 68, 68, 0.2)',
+        backgroundColor: 'rgba(239, 68, 68, 0.15)',
         borderRadius: 12,
         padding: 15,
         borderWidth: 1,
         borderColor: 'rgba(239, 68, 68, 0.3)',
+        alignItems: 'center',
     },
     warningText: {
         color: '#fca5a5',
-        fontSize: 14,
-        textAlign: 'center',
+        fontSize: 16,
+        fontWeight: '600',
+        marginBottom: 4,
+    },
+    warningSubtext: {
+        color: '#f87171',
+        fontSize: 12,
     },
 });
 

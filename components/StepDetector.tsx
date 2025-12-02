@@ -16,14 +16,6 @@ interface StepDetectorProps {
     isActive: boolean;
 }
 
-interface StepData {
-    timestamp: number;
-    magnitude: number;
-    x: number;
-    y: number;
-    z: number;
-}
-
 const StepDetector: React.FC<StepDetectorProps> = ({
     targetSteps,
     onTargetReached,
@@ -31,31 +23,54 @@ const StepDetector: React.FC<StepDetectorProps> = ({
     isActive,
 }) => {
     const [stepCount, setStepCount] = useState<number>(0);
-    const [validStepCount, setValidStepCount] = useState<number>(0);
-    const [cheatingWarning, setCheatingWarning] = useState<string>('');
-    const [magnitude, setMagnitude] = useState<number>(1);
-    const [isWalking, setIsWalking] = useState<boolean>(false);
+    const [status, setStatus] = useState<string>('Waiting to start...');
+    const [statusType, setStatusType] = useState<'info' | 'warning' | 'success' | 'walking'>('info');
+    const [debugInfo, setDebugInfo] = useState({
+        magnitude: 0,
+        variance: 0,
+        avgInterval: 0,
+        lastStepTime: 0,
+    });
 
     // Animation
-    const [pulseAnim] = useState(new Animated.Value(1));
-    const [progressAnim] = useState(new Animated.Value(0));
+    const pulseAnim = useRef(new Animated.Value(1)).current;
+    const progressAnim = useRef(new Animated.Value(0)).current;
 
-    // Refs for step detection
+    // Step detection refs
     const subscriptionRef = useRef<any>(null);
-    const stepDataRef = useRef<StepData[]>([]);
+    const stepCountRef = useRef<number>(0);
+    const magnitudeHistoryRef = useRef<number[]>([]);
+    const stepTimesRef = useRef<number[]>([]);
     const lastStepTimeRef = useRef<number>(0);
-    const stepIntervalsRef = useRef<number[]>([]);
-    const isAboveThresholdRef = useRef<boolean>(false);
-    const validStepCountRef = useRef<number>(0);
-    const consecutiveGoodStepsRef = useRef<number>(0);
-    const xMovementHistoryRef = useRef<number[]>([]);
+    const lastPeakTimeRef = useRef<number>(0);
+    const isInStepRef = useRef<boolean>(false);
+    const baselineRef = useRef<number>(1);
+    const movementBufferRef = useRef<{ x: number, y: number, z: number }[]>([]);
 
-    // Anti-cheat settings
-    const MIN_STEP_INTERVAL = 300;      // Min 300ms between steps (max ~3 steps/sec)
-    const MAX_STEP_INTERVAL = 1500;     // Max 1.5s between steps
-    const RHYTHM_TOLERANCE = 0.5;       // 50% variation allowed in step rhythm
-    const MIN_X_MOVEMENT = 0.15;        // Minimum sideways sway while walking
-    const REQUIRED_CONSISTENT_STEPS = 3; // Need 3 consistent steps to validate
+    // Anti-cheat: Track movement patterns
+    const peakMagnitudesRef = useRef<number[]>([]);
+    const valleyMagnitudesRef = useRef<number[]>([]);
+
+    // Settings - TUNED FOR REAL WALKING
+    const SETTINGS = {
+        // Step timing
+        MIN_STEP_INTERVAL: 280,      // Minimum ms between steps (fast walk)
+        MAX_STEP_INTERVAL: 1200,     // Maximum ms between steps (slow walk)
+        IDEAL_STEP_INTERVAL: 500,    // Ideal step interval ~500ms
+
+        // Magnitude thresholds
+        STEP_THRESHOLD_MULTIPLIER: 1.08, // Lower = more sensitive
+        MIN_PEAK_MAGNITUDE: 0.12,    // Minimum magnitude change for a step
+
+        // Anti-cheat
+        MIN_STEPS_TO_VALIDATE: 2,    // Need 2 steps to start validating pattern
+        MAX_RHYTHM_VARIANCE: 0.6,    // Allow 60% variance in rhythm (walking varies naturally)
+        MIN_RHYTHM_VARIANCE: 0.05,   // Minimum variance (too consistent = machine/shaking)
+
+        // Movement analysis
+        MOVEMENT_WINDOW: 30,         // Number of samples to analyze
+        UPDATE_INTERVAL: 40,         // Accelerometer update interval (ms)
+    };
 
     useEffect(() => {
         if (isActive) {
@@ -70,170 +85,278 @@ const StepDetector: React.FC<StepDetectorProps> = ({
     useEffect(() => {
         // Animate progress
         Animated.timing(progressAnim, {
-            toValue: validStepCount / targetSteps,
+            toValue: Math.min(stepCount / targetSteps, 1),
             duration: 200,
             useNativeDriver: false,
         }).start();
 
-        onStepCountChange?.(validStepCount);
+        onStepCountChange?.(stepCount);
 
-        if (validStepCount >= targetSteps) {
+        if (stepCount >= targetSteps) {
+            setStatus('🎉 Target reached! Great job!');
+            setStatusType('success');
             onTargetReached();
         }
-    }, [validStepCount]);
+    }, [stepCount, targetSteps]);
 
-    const startDetection = () => {
-        console.log('🚀 Starting anti-cheat step detection...');
+    const startDetection = useCallback(() => {
+        console.log('🚀 Starting improved step detection...');
 
         // Reset everything
+        stepCountRef.current = 0;
         setStepCount(0);
-        setValidStepCount(0);
-        validStepCountRef.current = 0;
-        stepDataRef.current = [];
-        stepIntervalsRef.current = [];
-        lastStepTimeRef.current = Date.now();
-        consecutiveGoodStepsRef.current = 0;
-        xMovementHistoryRef.current = [];
-        setCheatingWarning('');
+        magnitudeHistoryRef.current = [];
+        stepTimesRef.current = [];
+        lastStepTimeRef.current = 0;
+        lastPeakTimeRef.current = 0;
+        isInStepRef.current = false;
+        baselineRef.current = 1;
+        movementBufferRef.current = [];
+        peakMagnitudesRef.current = [];
+        valleyMagnitudesRef.current = [];
 
-        Accelerometer.setUpdateInterval(50);
+        setStatus('👟 Start walking with your phone');
+        setStatusType('info');
+
+        Accelerometer.setUpdateInterval(SETTINGS.UPDATE_INTERVAL);
 
         subscriptionRef.current = Accelerometer.addListener((data) => {
-            processAccelerometerData(data);
+            processMovement(data);
         });
-    };
+    }, []);
 
-    const stopDetection = () => {
+    const stopDetection = useCallback(() => {
         if (subscriptionRef.current) {
             subscriptionRef.current.remove();
             subscriptionRef.current = null;
         }
-    };
+    }, []);
 
-    const processAccelerometerData = (data: { x: number; y: number; z: number }) => {
+    const processMovement = (data: { x: number; y: number; z: number }) => {
         const { x, y, z } = data;
-        const mag = Math.sqrt(x * x + y * y + z * z);
         const now = Date.now();
 
-        setMagnitude(mag);
+        // Calculate magnitude (total acceleration)
+        const magnitude = Math.sqrt(x * x + y * y + z * z);
 
-        // Track X movement (sideways sway)
-        xMovementHistoryRef.current.push(Math.abs(x));
-        if (xMovementHistoryRef.current.length > 20) {
-            xMovementHistoryRef.current.shift();
+        // Store movement data
+        movementBufferRef.current.push({ x, y, z });
+        if (movementBufferRef.current.length > SETTINGS.MOVEMENT_WINDOW) {
+            movementBufferRef.current.shift();
         }
 
-        // Store data for pattern analysis
-        stepDataRef.current.push({ timestamp: now, magnitude: mag, x, y, z });
-        if (stepDataRef.current.length > 50) {
-            stepDataRef.current.shift();
+        // Store magnitude history
+        magnitudeHistoryRef.current.push(magnitude);
+        if (magnitudeHistoryRef.current.length > SETTINGS.MOVEMENT_WINDOW) {
+            magnitudeHistoryRef.current.shift();
         }
 
-        // Dynamic threshold
-        const recentMagnitudes = stepDataRef.current.slice(-20).map(d => d.magnitude);
-        const avgMag = recentMagnitudes.reduce((a, b) => a + b, 0) / recentMagnitudes.length || 1;
-        const threshold = avgMag * 1.12;
-
-        // Detect step crossing
-        if (mag > threshold && !isAboveThresholdRef.current) {
-            isAboveThresholdRef.current = true;
+        // Calculate baseline (average magnitude)
+        if (magnitudeHistoryRef.current.length >= 10) {
+            baselineRef.current = magnitudeHistoryRef.current.reduce((a, b) => a + b, 0)
+                / magnitudeHistoryRef.current.length;
         }
 
-        if (mag < threshold && isAboveThresholdRef.current) {
-            isAboveThresholdRef.current = false;
+        // Dynamic threshold based on baseline
+        const threshold = baselineRef.current * SETTINGS.STEP_THRESHOLD_MULTIPLIER;
+        const deviation = magnitude - baselineRef.current;
 
-            const timeSinceLastStep = now - lastStepTimeRef.current;
+        // Update debug info
+        setDebugInfo({
+            magnitude: magnitude,
+            variance: calculateRhythmVariance(),
+            avgInterval: calculateAverageInterval(),
+            lastStepTime: now - lastStepTimeRef.current,
+        });
 
-            // Basic timing check
-            if (timeSinceLastStep >= MIN_STEP_INTERVAL) {
-                // Raw step detected
-                setStepCount(prev => prev + 1);
+        // Step detection using peak detection
+        detectStep(magnitude, threshold, deviation, now);
+    };
 
-                // Now validate with anti-cheat
-                const isValid = validateStep(timeSinceLastStep);
+    const detectStep = (magnitude: number, threshold: number, deviation: number, now: number) => {
+        const timeSinceLastStep = now - lastStepTimeRef.current;
+        const timeSinceLastPeak = now - lastPeakTimeRef.current;
 
-                if (isValid) {
-                    validStepCountRef.current += 1;
-                    setValidStepCount(validStepCountRef.current);
-                    setCheatingWarning('');
+        // Detect peak (going above threshold)
+        if (magnitude > threshold && !isInStepRef.current && deviation > SETTINGS.MIN_PEAK_MAGNITUDE) {
+            isInStepRef.current = true;
+            lastPeakTimeRef.current = now;
+            peakMagnitudesRef.current.push(magnitude);
 
-                    // Visual feedback
-                    Vibration.vibrate(80);
-                    pulseStep();
+            if (peakMagnitudesRef.current.length > 10) {
+                peakMagnitudesRef.current.shift();
+            }
+        }
 
-                    console.log(`✅ Valid step ${validStepCountRef.current}/${targetSteps}`);
-                } else {
-                    console.log('❌ Step rejected (anti-cheat)');
+        // Detect valley (coming back down) = step complete
+        if (magnitude < threshold && isInStepRef.current) {
+            isInStepRef.current = false;
+
+            valleyMagnitudesRef.current.push(magnitude);
+            if (valleyMagnitudesRef.current.length > 10) {
+                valleyMagnitudesRef.current.shift();
+            }
+
+            // Check if this is a valid step
+            const peakDuration = now - lastPeakTimeRef.current;
+
+            // Step must have reasonable duration (not just noise)
+            if (peakDuration < 50 || peakDuration > 400) {
+                return; // Too short or too long for a step
+            }
+
+            // Check timing between steps
+            if (timeSinceLastStep < SETTINGS.MIN_STEP_INTERVAL) {
+                // Too fast - might be shaking
+                if (stepTimesRef.current.length >= SETTINGS.MIN_STEPS_TO_VALIDATE) {
+                    setStatus('⚠️ Too fast! Walk at a normal pace');
+                    setStatusType('warning');
                 }
+                return;
+            }
 
-                // Update tracking
-                stepIntervalsRef.current.push(timeSinceLastStep);
-                if (stepIntervalsRef.current.length > 10) {
-                    stepIntervalsRef.current.shift();
+            // Validate step pattern
+            const validation = validateStepPattern(now);
+
+            if (validation.isValid) {
+                // Valid step!
+                stepCountRef.current += 1;
+                setStepCount(stepCountRef.current);
+
+                // Record step time
+                stepTimesRef.current.push(now);
+                if (stepTimesRef.current.length > 10) {
+                    stepTimesRef.current.shift();
                 }
 
                 lastStepTimeRef.current = now;
+
+                // Feedback
+                Vibration.vibrate(60);
+                animatePulse();
+
+                if (validation.isWalking) {
+                    setStatus(`🚶 Walking detected! Keep going!`);
+                    setStatusType('walking');
+                } else {
+                    setStatus(`👟 ${targetSteps - stepCountRef.current} more steps needed`);
+                    setStatusType('info');
+                }
+
+                console.log(`✅ Step ${stepCountRef.current} | Interval: ${timeSinceLastStep}ms`);
+            } else {
+                setStatus(validation.reason);
+                setStatusType('warning');
+                console.log(`❌ Step rejected: ${validation.reason}`);
             }
         }
     };
 
-    const validateStep = (interval: number): boolean => {
-        // Check 1: Step interval within reasonable range
-        if (interval < MIN_STEP_INTERVAL) {
-            setCheatingWarning('⚠️ Too fast! Walk normally.');
-            consecutiveGoodStepsRef.current = 0;
-            return false;
+    const validateStepPattern = (now: number): { isValid: boolean; isWalking: boolean; reason: string } => {
+        // Not enough steps yet to validate pattern - allow first few steps
+        if (stepTimesRef.current.length < SETTINGS.MIN_STEPS_TO_VALIDATE) {
+            return { isValid: true, isWalking: false, reason: '' };
         }
 
-        if (interval > MAX_STEP_INTERVAL) {
-            // Reset rhythm tracking if too slow
-            stepIntervalsRef.current = [];
-            consecutiveGoodStepsRef.current = 0;
-            return true; // Allow but reset rhythm
+        // Calculate rhythm variance
+        const variance = calculateRhythmVariance();
+
+        // Check for robotic/mechanical movement (too consistent = shaking machine or deliberate cheating)
+        if (variance < SETTINGS.MIN_RHYTHM_VARIANCE && stepTimesRef.current.length >= 4) {
+            return {
+                isValid: false,
+                isWalking: false,
+                reason: '⚠️ Movement too robotic! Walk naturally'
+            };
         }
 
-        // Check 2: X-axis movement (body sway)
-        const avgXMovement = xMovementHistoryRef.current.length > 0
-            ? xMovementHistoryRef.current.reduce((a, b) => a + b, 0) / xMovementHistoryRef.current.length
-            : 0;
-
-        if (avgXMovement < MIN_X_MOVEMENT) {
-            // Low X movement = probably just bouncing phone up/down
-            setCheatingWarning('⚠️ Walk with phone in hand, not just bouncing!');
-            consecutiveGoodStepsRef.current = 0;
-            return false;
+        // Check for chaotic movement (too random = random shaking)
+        if (variance > SETTINGS.MAX_RHYTHM_VARIANCE && stepTimesRef.current.length >= 4) {
+            return {
+                isValid: false,
+                isWalking: false,
+                reason: '⚠️ Inconsistent rhythm! Walk steadily'
+            };
         }
 
-        // Check 3: Rhythm consistency (after we have enough data)
-        if (stepIntervalsRef.current.length >= 3) {
-            const intervals = stepIntervalsRef.current.slice(-5);
-            const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-            const variance = intervals.reduce((sum, int) => sum + Math.abs(int - avgInterval), 0) / intervals.length;
-            const rhythmScore = variance / avgInterval;
-
-            // Walking has consistent rhythm, shaking is random
-            if (rhythmScore > RHYTHM_TOLERANCE) {
-                setCheatingWarning('⚠️ Inconsistent rhythm! Walk steadily.');
-                consecutiveGoodStepsRef.current = 0;
-                return false;
-            }
-
-            setIsWalking(true);
+        // Check if movement is only vertical (up-down shaking)
+        const isOnlyVertical = checkIfOnlyVerticalMovement();
+        if (isOnlyVertical && stepTimesRef.current.length >= 3) {
+            return {
+                isValid: false,
+                isWalking: false,
+                reason: '⚠️ Walk around, don\'t just shake!'
+            };
         }
 
-        // Step passed all checks
-        consecutiveGoodStepsRef.current += 1;
+        // Determine if this is real walking
+        const isWalking = variance >= SETTINGS.MIN_RHYTHM_VARIANCE &&
+            variance <= SETTINGS.MAX_RHYTHM_VARIANCE &&
+            stepTimesRef.current.length >= 3;
 
-        // Only count after we've verified it's real walking
-        if (consecutiveGoodStepsRef.current >= REQUIRED_CONSISTENT_STEPS) {
-            return true;
-        } else {
-            // Building confidence, count these too but with note
-            return true;
-        }
+        return { isValid: true, isWalking, reason: '' };
     };
 
-    const pulseStep = () => {
+    const checkIfOnlyVerticalMovement = (): boolean => {
+        if (movementBufferRef.current.length < 10) return false;
+
+        const recentMovement = movementBufferRef.current.slice(-15);
+
+        // Calculate variance in each axis
+        const xValues = recentMovement.map(m => m.x);
+        const yValues = recentMovement.map(m => m.y);
+        const zValues = recentMovement.map(m => m.z);
+
+        const xVariance = calculateVariance(xValues);
+        const yVariance = calculateVariance(yValues);
+        const zVariance = calculateVariance(zValues);
+
+        const totalVariance = xVariance + yVariance + zVariance;
+
+        if (totalVariance === 0) return false;
+
+        // If Y (vertical) dominates too much, it's probably just up-down shaking
+        const yRatio = yVariance / totalVariance;
+
+        // Walking should have movement in multiple axes
+        // Shaking up-down has mostly Y movement
+        return yRatio > 0.85; // If 85%+ of movement is vertical, likely shaking
+    };
+
+    const calculateVariance = (values: number[]): number => {
+        if (values.length === 0) return 0;
+        const mean = values.reduce((a, b) => a + b, 0) / values.length;
+        return values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / values.length;
+    };
+
+    const calculateRhythmVariance = (): number => {
+        if (stepTimesRef.current.length < 3) return 0.3; // Default middle variance
+
+        const intervals: number[] = [];
+        for (let i = 1; i < stepTimesRef.current.length; i++) {
+            intervals.push(stepTimesRef.current[i] - stepTimesRef.current[i - 1]);
+        }
+
+        if (intervals.length === 0) return 0.3;
+
+        const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+        const variance = intervals.reduce((sum, int) => sum + Math.abs(int - avgInterval), 0) / intervals.length;
+
+        return variance / avgInterval; // Normalized variance (coefficient of variation)
+    };
+
+    const calculateAverageInterval = (): number => {
+        if (stepTimesRef.current.length < 2) return 0;
+
+        const intervals: number[] = [];
+        for (let i = 1; i < stepTimesRef.current.length; i++) {
+            intervals.push(stepTimesRef.current[i] - stepTimesRef.current[i - 1]);
+        }
+
+        return intervals.reduce((a, b) => a + b, 0) / intervals.length;
+    };
+
+    const animatePulse = () => {
         Animated.sequence([
             Animated.timing(pulseAnim, {
                 toValue: 1.15,
@@ -248,17 +371,19 @@ const StepDetector: React.FC<StepDetectorProps> = ({
         ]).start();
     };
 
+    const getStatusColor = () => {
+        switch (statusType) {
+            case 'success': return '#22c55e';
+            case 'warning': return '#f59e0b';
+            case 'walking': return '#22c55e';
+            default: return '#f97316';
+        }
+    };
+
     const progressWidth = progressAnim.interpolate({
         inputRange: [0, 1],
         outputRange: ['0%', '100%'],
     });
-
-    const getStatusColor = () => {
-        if (validStepCount >= targetSteps) return '#22c55e';
-        if (cheatingWarning) return '#ef4444';
-        if (isWalking) return '#22c55e';
-        return '#f97316';
-    };
 
     return (
         <View style={styles.container}>
@@ -266,7 +391,7 @@ const StepDetector: React.FC<StepDetectorProps> = ({
             <Animated.View style={[styles.circleContainer, { transform: [{ scale: pulseAnim }] }]}>
                 <View style={[styles.stepCircle, { borderColor: getStatusColor() }]}>
                     <Text style={[styles.stepCount, { color: getStatusColor() }]}>
-                        {validStepCount}
+                        {stepCount}
                     </Text>
                     <Text style={styles.stepTarget}>/ {targetSteps}</Text>
                     <Text style={styles.stepLabel}>steps</Text>
@@ -284,47 +409,53 @@ const StepDetector: React.FC<StepDetectorProps> = ({
                     />
                 </View>
                 <Text style={styles.progressPercent}>
-                    {Math.round((validStepCount / targetSteps) * 100)}%
+                    {Math.round((stepCount / targetSteps) * 100)}%
                 </Text>
             </View>
 
-            {/* Status Messages */}
-            <View style={styles.statusContainer}>
-                {cheatingWarning ? (
-                    <View style={styles.warningBox}>
-                        <Text style={styles.warningText}>{cheatingWarning}</Text>
-                    </View>
-                ) : validStepCount >= targetSteps ? (
-                    <Text style={styles.successText}>🎉 Target reached! Great job!</Text>
-                ) : isWalking ? (
-                    <Text style={styles.walkingText}>🚶 Walking detected! Keep going!</Text>
-                ) : (
-                    <Text style={styles.instructionText}>
-                        👟 Walk with your phone to count steps
-                    </Text>
-                )}
+            {/* Status Message */}
+            <View style={[styles.statusBox, { borderColor: getStatusColor() }]}>
+                <Text style={[styles.statusText, { color: getStatusColor() }]}>
+                    {status}
+                </Text>
             </View>
 
-            {/* Debug Info */}
+            {/* Debug Info (helpful for testing) */}
             <View style={styles.debugContainer}>
-                <View style={styles.debugRow}>
-                    <Text style={styles.debugLabel}>Raw Steps:</Text>
-                    <Text style={styles.debugValue}>{stepCount}</Text>
+                <Text style={styles.debugTitle}>📊 Detection Info</Text>
+                <View style={styles.debugGrid}>
+                    <View style={styles.debugItem}>
+                        <Text style={styles.debugLabel}>Magnitude</Text>
+                        <Text style={styles.debugValue}>{debugInfo.magnitude.toFixed(2)}</Text>
+                    </View>
+                    <View style={styles.debugItem}>
+                        <Text style={styles.debugLabel}>Rhythm</Text>
+                        <Text style={[
+                            styles.debugValue,
+                            debugInfo.variance > 0.05 && debugInfo.variance < 0.6
+                                ? styles.debugGood
+                                : styles.debugBad
+                        ]}>
+                            {(debugInfo.variance * 100).toFixed(0)}%
+                        </Text>
+                    </View>
+                    <View style={styles.debugItem}>
+                        <Text style={styles.debugLabel}>Interval</Text>
+                        <Text style={styles.debugValue}>{Math.round(debugInfo.avgInterval)}ms</Text>
+                    </View>
+                    <View style={styles.debugItem}>
+                        <Text style={styles.debugLabel}>Since Last</Text>
+                        <Text style={styles.debugValue}>{Math.round(debugInfo.lastStepTime)}ms</Text>
+                    </View>
                 </View>
-                <View style={styles.debugRow}>
-                    <Text style={styles.debugLabel}>Valid Steps:</Text>
-                    <Text style={[styles.debugValue, { color: '#22c55e' }]}>{validStepCount}</Text>
-                </View>
-                <View style={styles.debugRow}>
-                    <Text style={styles.debugLabel}>Magnitude:</Text>
-                    <Text style={styles.debugValue}>{magnitude.toFixed(3)}</Text>
-                </View>
-                <View style={styles.debugRow}>
-                    <Text style={styles.debugLabel}>Status:</Text>
-                    <Text style={[styles.debugValue, { color: getStatusColor() }]}>
-                        {isWalking ? '✅ Walking' : '⏳ Waiting'}
-                    </Text>
-                </View>
+            </View>
+
+            {/* Tips */}
+            <View style={styles.tipsContainer}>
+                <Text style={styles.tipsTitle}>💡 Tips:</Text>
+                <Text style={styles.tipText}>• Hold phone naturally while walking</Text>
+                <Text style={styles.tipText}>• Walk at a steady, normal pace</Text>
+                <Text style={styles.tipText}>• Don't shake - actually walk!</Text>
             </View>
         </View>
     );
@@ -333,113 +464,128 @@ const StepDetector: React.FC<StepDetectorProps> = ({
 const styles = StyleSheet.create({
     container: {
         alignItems: 'center',
-        paddingVertical: 20,
+        paddingVertical: 10,
     },
     circleContainer: {
-        marginBottom: 20,
+        marginBottom: 15,
     },
     stepCircle: {
-        width: 180,
-        height: 180,
-        borderRadius: 90,
-        borderWidth: 6,
+        width: 160,
+        height: 160,
+        borderRadius: 80,
+        borderWidth: 5,
         backgroundColor: '#1e293b',
         justifyContent: 'center',
         alignItems: 'center',
     },
     stepCount: {
-        fontSize: 56,
+        fontSize: 52,
         fontWeight: 'bold',
     },
     stepTarget: {
-        fontSize: 20,
+        fontSize: 18,
         color: '#64748b',
         marginTop: -5,
     },
     stepLabel: {
-        fontSize: 16,
+        fontSize: 14,
         color: '#64748b',
     },
     progressContainer: {
         flexDirection: 'row',
         alignItems: 'center',
         width: '100%',
-        paddingHorizontal: 20,
-        marginBottom: 20,
+        paddingHorizontal: 10,
+        marginBottom: 15,
     },
     progressBg: {
         flex: 1,
-        height: 14,
+        height: 12,
         backgroundColor: '#1e293b',
-        borderRadius: 7,
+        borderRadius: 6,
         overflow: 'hidden',
-        marginRight: 12,
+        marginRight: 10,
     },
     progressFill: {
         height: '100%',
-        borderRadius: 7,
+        borderRadius: 6,
     },
     progressPercent: {
         color: '#ffffff',
-        fontSize: 18,
+        fontSize: 16,
         fontWeight: 'bold',
-        width: 50,
+        width: 45,
         textAlign: 'right',
     },
-    statusContainer: {
-        minHeight: 60,
-        justifyContent: 'center',
-        alignItems: 'center',
-        paddingHorizontal: 20,
-    },
-    warningBox: {
-        backgroundColor: 'rgba(239, 68, 68, 0.2)',
+    statusBox: {
+        backgroundColor: 'rgba(30, 41, 59, 0.8)',
         borderWidth: 1,
-        borderColor: '#ef4444',
         borderRadius: 12,
-        padding: 15,
+        paddingVertical: 12,
+        paddingHorizontal: 20,
+        marginBottom: 15,
+        minWidth: '90%',
     },
-    warningText: {
-        color: '#ef4444',
+    statusText: {
         fontSize: 16,
         fontWeight: '600',
-        textAlign: 'center',
-    },
-    successText: {
-        color: '#22c55e',
-        fontSize: 20,
-        fontWeight: 'bold',
-    },
-    walkingText: {
-        color: '#22c55e',
-        fontSize: 18,
-        fontWeight: '600',
-    },
-    instructionText: {
-        color: '#94a3b8',
-        fontSize: 16,
         textAlign: 'center',
     },
     debugContainer: {
         backgroundColor: '#1e293b',
         borderRadius: 12,
-        padding: 15,
-        marginTop: 20,
+        padding: 12,
         width: '100%',
+        marginBottom: 10,
     },
-    debugRow: {
-        flexDirection: 'row',
-        justifyContent: 'space-between',
+    debugTitle: {
+        color: '#94a3b8',
+        fontSize: 12,
         marginBottom: 8,
+        textAlign: 'center',
+    },
+    debugGrid: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        justifyContent: 'space-between',
+    },
+    debugItem: {
+        width: '48%',
+        backgroundColor: '#0f172a',
+        borderRadius: 8,
+        padding: 8,
+        marginBottom: 6,
+        alignItems: 'center',
     },
     debugLabel: {
         color: '#64748b',
-        fontSize: 14,
+        fontSize: 11,
+        marginBottom: 2,
     },
     debugValue: {
         color: '#ffffff',
         fontSize: 14,
-        fontWeight: '600',
+        fontWeight: 'bold',
+    },
+    debugGood: {
+        color: '#22c55e',
+    },
+    debugBad: {
+        color: '#f59e0b',
+    },
+    tipsContainer: {
+        width: '100%',
+        paddingHorizontal: 5,
+    },
+    tipsTitle: {
+        color: '#94a3b8',
+        fontSize: 12,
+        marginBottom: 4,
+    },
+    tipText: {
+        color: '#64748b',
+        fontSize: 11,
+        marginBottom: 2,
     },
 });
 

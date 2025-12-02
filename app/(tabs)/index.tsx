@@ -1,114 +1,148 @@
 // App.tsx
-import React, { useState, useEffect, useRef } from 'react';
-import { SafeAreaView, StatusBar, AppState, AppStateStatus } from 'react-native';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  SafeAreaView,
+  StatusBar,
+  AppState,
+  AppStateStatus,
+  View,
+  Text,
+  StyleSheet,
+} from 'react-native';
 import AlarmScreen from '../../components/AlarmScreen';
 import SetAlarmScreen from '../../components/SetAlarmScreen';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
-interface Alarm {
-  id: string;
-  hour: number;
-  minute: number;
-  enabled: boolean;
-  requiredSteps: number;
-  label: string;
-  days: number[];
-}
+import { AlarmManager, Alarm } from '../../utils/alarmManager';
 
 export default function HomeScreen() {
   const [showAlarm, setShowAlarm] = useState<boolean>(false);
   const [activeAlarm, setActiveAlarm] = useState<Alarm | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+
   const appState = useRef(AppState.currentState);
   const checkIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isCheckingRef = useRef<boolean>(false);
 
   useEffect(() => {
-    // Check alarm time periodically
-    startAlarmChecker();
+    initializeApp();
 
     // Handle app state changes
     const subscription = AppState.addEventListener('change', handleAppStateChange);
 
     return () => {
       subscription.remove();
-      if (checkIntervalRef.current) {
-        clearInterval(checkIntervalRef.current);
-      }
+      stopAlarmChecker();
     };
-  }, [activeAlarm]);
+  }, []);
 
-  const handleAppStateChange = (nextAppState: AppStateStatus) => {
+  const initializeApp = async () => {
+    console.log('🚀 Initializing app...');
+
+    // Load saved alarm
+    const alarm = await AlarmManager.loadAlarm();
+    if (alarm && alarm.enabled) {
+      setActiveAlarm(alarm);
+      console.log('📱 Loaded alarm:', alarm);
+    }
+
+    setIsLoading(false);
+
+    // Start checking
+    startAlarmChecker();
+  };
+
+  const handleAppStateChange = useCallback((nextAppState: AppStateStatus) => {
+    console.log(`📱 App state: ${appState.current} → ${nextAppState}`);
+
     if (
       appState.current.match(/inactive|background/) &&
       nextAppState === 'active'
     ) {
-      // App came to foreground - check if alarm should ring
+      // App came to foreground
+      console.log('👀 App came to foreground');
       checkAlarmTime();
     }
+
     appState.current = nextAppState;
-  };
+  }, []);
 
   const startAlarmChecker = () => {
-    // Check every 30 seconds
-    checkIntervalRef.current = setInterval(checkAlarmTime, 30000);
-    // Also check immediately
+    console.log('⏰ Starting alarm checker (every 10 seconds)...');
+
+    // Clear any existing interval
+    stopAlarmChecker();
+
+    // Check immediately
     checkAlarmTime();
+
+    // Then check every 10 seconds
+    checkIntervalRef.current = setInterval(() => {
+      checkAlarmTime();
+    }, 10000);
+  };
+
+  const stopAlarmChecker = () => {
+    if (checkIntervalRef.current) {
+      clearInterval(checkIntervalRef.current);
+      checkIntervalRef.current = null;
+    }
   };
 
   const checkAlarmTime = async () => {
+    // Prevent concurrent checks
+    if (isCheckingRef.current || showAlarm) {
+      return;
+    }
+
+    isCheckingRef.current = true;
+
     try {
-      const saved = await AsyncStorage.getItem('walkAlarm');
-      if (!saved) return;
+      const { shouldTrigger, alarm } = await AlarmManager.shouldTrigger();
 
-      const alarm: Alarm = JSON.parse(saved);
-      if (!alarm.enabled) return;
+      if (shouldTrigger && alarm) {
+        console.log('🔔 TRIGGERING ALARM!');
 
-      const now = new Date();
-      const currentDay = now.getDay();
-      
-      // Check if today is a scheduled day
-      if (!alarm.days.includes(currentDay)) return;
+        // Mark as triggered BEFORE showing alarm to prevent re-triggers
+        await AlarmManager.markTriggered();
 
-      const currentHour = now.getHours();
-      const currentMinute = now.getMinutes();
-
-      // Check if it's alarm time (within 1 minute window)
-      if (
-        currentHour === alarm.hour &&
-        currentMinute >= alarm.minute &&
-        currentMinute <= alarm.minute + 1
-      ) {
-        console.log('⏰ ALARM TIME!');
+        // Update state
         setActiveAlarm(alarm);
         setShowAlarm(true);
       }
     } catch (error) {
       console.error('Error checking alarm:', error);
+    } finally {
+      isCheckingRef.current = false;
     }
   };
 
-  const handleTestAlarm = () => {
+  const handleTestAlarm = useCallback(() => {
     console.log('🧪 Testing alarm...');
     setShowAlarm(true);
-  };
+  }, []);
 
-  const handleDismissAlarm = async () => {
-    console.log('✅ Alarm dismissed!');
+  const handleAlarmChange = useCallback((alarm: Alarm | null) => {
+    console.log('📝 Alarm changed:', alarm?.enabled ? 'Enabled' : 'Disabled');
+    setActiveAlarm(alarm);
+  }, []);
+
+  const handleDismissAlarm = useCallback(async () => {
+    console.log('✅ Alarm dismissed by walking!');
+
     setShowAlarm(false);
-    
-    // Optionally log wake-up success
-    try {
-      const wakeUpLog = {
-        date: new Date().toISOString(),
-        success: true,
-      };
-      const logs = await AsyncStorage.getItem('wakeUpLogs');
-      const logsArray = logs ? JSON.parse(logs) : [];
-      logsArray.push(wakeUpLog);
-      await AsyncStorage.setItem('wakeUpLogs', JSON.stringify(logsArray));
-    } catch (error) {
-      console.error('Error logging wake-up:', error);
+
+    // Log the successful wake-up
+    if (activeAlarm) {
+      await AlarmManager.logWakeUp(activeAlarm.requiredSteps);
     }
-  };
+  }, [activeAlarm]);
+
+  if (isLoading) {
+    return (
+      <View style={styles.loadingContainer}>
+        <Text style={styles.loadingText}>⏰ Loading...</Text>
+      </View>
+    );
+  }
 
   if (showAlarm) {
     return (
@@ -120,13 +154,29 @@ export default function HomeScreen() {
   }
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: '#0f172a' }}>
+    <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
       <SetAlarmScreen
         onTestAlarm={handleTestAlarm}
-        activeAlarm={activeAlarm}
-        setActiveAlarm={setActiveAlarm}
+        onAlarmChange={handleAlarmChange}
       />
     </SafeAreaView>
   );
 }
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+  },
+  loadingContainer: {
+    flex: 1,
+    backgroundColor: '#0f172a',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  loadingText: {
+    color: '#ffffff',
+    fontSize: 24,
+  },
+});
